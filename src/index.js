@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-const Promise = require('bluebird');
 const _ = require('lodash');
 const fs = require('fs');
-const git = require('nodegit');
+const git = require('isomorphic-git');
+const { execSync } = require('child_process');
 const moment = require('moment');
-const program = require('commander');
+const { Command } = require('commander');
+
+const program = new Command();
 
 const DATE_FORMAT = 'YYYY-MM-DD';
 
@@ -62,98 +64,134 @@ function estimateHours(dates) {
   return Math.round(totalHours);
 }
 
-function getBranchCommits(branchLatestCommit) {
-  return new Promise((resolve, reject) => {
-    const history = branchLatestCommit.history();
+
+// Fallback function using git command line
+function getCommitsWithGitCLI(gitPath, branch) {
+  try {
+    const branchArg = branch ? branch : '--all';
+    const mergeFlag = config.mergeRequest ? '' : '--no-merges';
+    const gitCmd = `git -C "${gitPath}" log ${branchArg} --pretty=format:"%H|%an|%ae|%ct|%s" ${mergeFlag}`;
+    const output = execSync(gitCmd, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+
     const commits = [];
+    const lines = output.trim().split('\n');
 
-    history.on('commit', (commit) => {
-      let author = null;
-      if (!_.isNull(commit.author())) {
-        author = {
-          name: commit.author().name(),
-          email: commit.author().email(),
-        };
+    lines.forEach((line) => {
+      if (!line) return;
+
+      const parts = line.split('|');
+      if (parts.length >= 5) {
+        const commitDate = new Date(parseInt(parts[3], 10) * 1000);
+
+        let isValidSince = true;
+        const sinceAlways = config.since === 'always' || !config.since;
+        if (!sinceAlways && !moment(commitDate.toISOString()).isAfter(config.since)) {
+          isValidSince = false;
+        }
+
+        let isValidUntil = true;
+        const untilAlways = config.until === 'always' || !config.until;
+        if (!untilAlways && !moment(commitDate.toISOString()).isBefore(config.until)) {
+          isValidUntil = false;
+        }
+
+        if (isValidSince && isValidUntil) {
+          const commitData = {
+            sha: parts[0],
+            date: commitDate,
+            message: parts.slice(4).join('|'), // Rejoin in case message contained |
+            author: {
+              name: parts[1],
+              email: parts[2],
+            },
+          };
+          commits.push(commitData);
+        }
       }
+    });
 
-      const commitData = {
-        sha: commit.sha(),
-        date: commit.date(),
-        message: commit.message(),
-        author,
-      };
+    return commits;
+  } catch (error) {
+    console.error('Error getting commits with git CLI:', error);
+    throw error;
+  }
+}
+
+// Get commits using isomorphic-git API with CLI fallback
+async function getCommits(gitPath, branch) {
+  const commits = [];
+
+  try {
+    // Try to find a valid ref to use
+    let ref = branch;
+    if (!ref) {
+      // Try different common refs
+      const possibleRefs = ['HEAD', 'main', 'master', 'origin/main', 'origin/master'];
+      for (const possibleRef of possibleRefs) {
+        try {
+          await git.resolveRef({ fs, dir: gitPath, ref: possibleRef });
+          ref = possibleRef;
+          break;
+        } catch (e) {
+          // Continue to next ref
+        }
+      }
+    }
+
+    if (!ref) {
+      throw new Error('Could not find any valid git reference');
+    }
+
+    // Get the commit log
+    const logs = await git.log({
+      fs,
+      dir: gitPath,
+      ref,
+      depth: undefined, // Get all commits
+    });
+
+    logs.forEach((log) => {
+      // Check date filters
+      const commitDate = new Date(log.commit.committer.timestamp * 1000);
 
       let isValidSince = true;
       const sinceAlways = config.since === 'always' || !config.since;
-      if (sinceAlways || moment(commitData.date.toISOString()).isAfter(config.since)) {
-        isValidSince = true;
-      } else {
+      if (!sinceAlways && !moment(commitDate.toISOString()).isAfter(config.since)) {
         isValidSince = false;
       }
 
       let isValidUntil = true;
       const untilAlways = config.until === 'always' || !config.until;
-      if (untilAlways || moment(commitData.date.toISOString()).isBefore(config.until)) {
-        isValidUntil = true;
-      } else {
+      if (!untilAlways && !moment(commitDate.toISOString()).isBefore(config.until)) {
         isValidUntil = false;
       }
 
       if (isValidSince && isValidUntil) {
+        // Filter merge commits if requested
+        if (!config.mergeRequest && log.commit.message.startsWith('Merge ')) {
+          return;
+        }
+
+        const commitData = {
+          sha: log.oid,
+          date: commitDate,
+          message: log.commit.message,
+          author: {
+            name: log.commit.author.name,
+            email: log.commit.author.email,
+          },
+        };
+
         commits.push(commitData);
       }
     });
-    history.on('end', () => resolve(commits));
-    history.on('error', reject);
 
-    // Start emitting events.
-    history.start();
-  });
-}
-
-function getBranchLatestCommit(repo, branchName) {
-  return repo.getBranch(branchName).then((reference) => repo.getBranchCommit(reference.name()));
-}
-
-function getAllReferences(repo) {
-  return repo.getReferenceNames(git.Reference.TYPE.ALL);
-}
-
-// Promisify nodegit's API of getting all commits in repository
-function getCommits(gitPath, branch) {
-  return git.Repository.open(gitPath)
-    .then((repo) => {
-      const allReferences = getAllReferences(repo);
-      let filterPromise;
-
-      if (branch) {
-        filterPromise = Promise.filter(allReferences, (reference) => (reference === `refs/heads/${branch}`));
-      } else {
-        filterPromise = Promise.filter(allReferences, (reference) => reference.match(/refs\/heads\/.*/));
-      }
-
-      return filterPromise.map((branchName) => getBranchLatestCommit(repo, branchName))
-        .map((branchLatestCommit) => getBranchCommits(branchLatestCommit))
-        .reduce((allCommits, branchCommits) => {
-          _.each(branchCommits, (commit) => {
-            allCommits.push(commit);
-          });
-
-          return allCommits;
-        }, [])
-        .then((commits) => {
-          // Multiple branches might share commits, so take unique
-          const uniqueCommits = _.uniq(commits, (item) => item.sha);
-
-          return uniqueCommits.filter((commit) => {
-            // Exclude all commits starting with "Merge ..."
-            if (!config.mergeRequest && commit.message.startsWith('Merge ')) {
-              return false;
-            }
-            return true;
-          });
-        });
-    });
+    return commits;
+  } catch (error) {
+    console.error('isomorphic-git failed, trying git CLI fallback:', error.message);
+    // Fallback to git CLI
+    return getCommitsWithGitCLI(gitPath, branch);
+  }
 }
 
 function parseEmailAlias(value) {
@@ -170,7 +208,6 @@ function parseEmailAlias(value) {
 }
 
 function mergeDefaultsWithArgs(conf) {
-
   const options = program.opts();
   return {
     range: options.range,
@@ -216,7 +253,7 @@ function parseArgs() {
   }
 
   program
-    .version(require('../package.json').version)
+    .version(require('../package.json').version, '-v, --version')
     .usage('[options]')
     .option(
       '-d, --max-commit-diff [max-commit-diff]',
@@ -289,7 +326,7 @@ function exitIfShallow() {
   }
 }
 
-function main() {
+async function main() {
   exitIfShallow();
 
   parseArgs();
@@ -310,7 +347,9 @@ function main() {
     }
   }
 
-  getCommits(config.gitPath, config.branch).then((commits) => {
+  try {
+    const commits = await getCommits(config.gitPath, config.branch);
+
     const commitsByEmail = _.groupBy(commits, (commit) => {
       let email = commit.author.email || 'unknown';
       if (config.emailAliases !== undefined && config.emailAliases[email] !== undefined) {
@@ -344,9 +383,9 @@ function main() {
     };
 
     console.log(JSON.stringify(sortedWork, undefined, 2));
-  }).catch((e) => {
+  } catch (e) {
     console.error(e.stack);
-  });
+  }
 }
 
 main();

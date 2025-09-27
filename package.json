@@ -29,18 +29,18 @@
   "homepage": "https://github.com/kimmobrunfeldt/git-hours",
   "dependencies": {
     "bluebird": "^3.7.2",
-    "commander": "^8.0.0",
+    "commander": "^12.0.0",
+    "isomorphic-git": "^1.33.2",
     "lodash": "^4.17.21",
-    "moment": "^2.10.6",
-    "nodegit": "^0.27.0"
+    "moment": "^2.30.1"
   },
   "devDependencies": {
-    "eslint": "^7.30.0",
-    "eslint-config-airbnb-base": "^14.2.1",
-    "eslint-plugin-import": "^2.23.4",
-    "mocha": "^9.0.2",
-    "nodemon": "^2.0.9",
-    "np": "^7.5.0"
+    "eslint": "^8.57.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-plugin-import": "^2.32.0",
+    "mocha": "^10.0.0",
+    "nodemon": "^3.0.0",
+    "np": "^10.0.0"
   },
   "scripts": {
     "dev": "npx nodemon --exec 'npm run test && npm run lint'",
@@ -48,6 +48,6 @@
     "lint": "npx eslint --ext js ."
   },
   "engines": {
-    "node": "^14.x"
+    "node": ">=18.0.0"
   }
 }
